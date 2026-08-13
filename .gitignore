@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data + weights (tải lại qua setup.sh)
+data/raw/audio/
+data/raw/meta.csv
+data/processed/
+checkpoints/
+pretrained/
+external/Amphion/
+repo/
+
+# Logs
+logs/
+*.log
+
+# Test artifacts
+test_output.wav

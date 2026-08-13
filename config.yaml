@@ -1,0 +1,46 @@
+# ═══════════════════════════════════════════════════════════════════════
+# TuneX — Cấu hình finetune Confucius4-TTS giọng Ngọc Huyền
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── Dataset (tự tải khi setup) ──
+datasets:
+  - repo: "pnnbao-ump/ngochuyen_voice"
+    text_col: "transcription"     # cột text trong parquet
+    audio_col: "audio"            # cột audio (dict: bytes + sampling_rate)
+    lang: "vi"
+  - repo: "thangnzt/NgocHuyenViVoice"
+    text_col: "text"
+    audio_col: "audio"
+    lang: "vi"
+
+# ── HF checkpoint (tự push khi train) ──
+hf:
+  repo_id: "Teedyyy-rm/Confucius4-storycast"
+  private: true
+  push_every_steps: 2000          # push checkpoint mỗi N steps (Stage 1 + 2)
+  push_every_epochs: 1            # push theo epoch (nếu train có epoch tracking)
+  token_file: "~/.cache/huggingface/token"   # nguồn token HF
+
+# ── Chuẩn bị dataset ──
+prepare:
+  out_dir: "data/processed"
+  val_ratio: 0.05
+  max_dur: 25.0                   # bỏ audio > 25s
+  target_sr: 22050                # chuẩn Confucius4 S2A
+  prompt_sr: 16000                # w2v-bert
+  ref_keep: 2
+
+# ── Log UI (tail -f /root/train.log theo dõi trực quan) ──
+logging:
+  ui: true
+  log_file: "/root/train.log"     # ⚠️ KHÔNG rm khi relaunch — append (tail -f giữ follow)
+
+# ── Training (ghi đè configs/*.yaml khi setup) ──
+training:
+  t2s_epochs: 20
+  s2a_epochs: 20
+  batch_size: 8                   # 16GB: 4-8 | 24GB: 8-16 | 32GB: 16-32
+  precision: "16-mixed"           # V100/2060: 16-mixed | Ampere+: bf16-mixed
+  accumulate_grad_batches: 2
+  learning_rate_t2s: 1.0e-4
+  learning_rate_s2a: 5.0e-5

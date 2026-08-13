@@ -1,0 +1,90 @@
+# ═══════════════════════════════════════════════════════════════════════
+# TuneX — S2A Training Config (Confucius4 finetune giọng mới)
+# Stage 2: semantic tokens → mel (flow-matching)
+# ═══════════════════════════════════════════════════════════════════════
+log_dir: ./logs/s2a_train
+
+seed: 42
+
+paths:
+  tokenizer_path: ./checkpoints
+  w2v_bert_path: ./pretrained/w2v-bert-2.0
+  w2v_stat: ./checkpoints/wav2vec2bert_stats.pt
+  t2s_checkpoint: ./checkpoints/t2s_model.safetensors   # frozen backbone
+
+  style_encoder:
+    target: external.campplus.CAMPPlus
+    init_args:
+      feat_dim: 80
+      embedding_size: 192
+    checkpoint: ./pretrained/campplus/campplus_cn_common.bin
+
+# ===================== Data Configuration =====================
+data:
+  train_data_path:
+    - ./data/processed/train.tsv
+  val_data_path:
+    - ./data/processed/val.tsv
+  batch_size: 8              # S2A nhẹ hơn T2S — batch cao hơn
+  num_workers: 8
+  max_text_seq_len: 520
+  max_semantic_seq_len: 1520
+  semantic_pad_token: 0
+  target_sample_rate: 22050
+  prompt_sample_rate: 16000
+
+# ===================== Audio Configuration =====================
+audio:
+  n_fft: 1024
+  win_length: 1024
+  hop_length: 256
+  n_mels: 80
+
+# ===================== Model Configuration (T2S) =====================
+t2s_model:
+  num_layers: 24
+  model_dim: 1280
+  num_heads: 20
+  max_text_seq_lens: 520
+  max_semantic_seq_lens: 1520
+  vocab_size: 32000
+  semantic_vocab_size: 8194
+  text_embedding_dim: 4096
+  speaker_embedding_dim: 1024
+  start_semantic_token: 8192
+  stop_semantic_token: 8193
+
+# ===================== Model Configuration (S2A) =====================
+s2a_model:
+  input_size: 512
+  output_size: 80
+  spk_embed_dim: 192
+  semantic_embed_dim: 1024
+  lm_latent_dim: 1280
+  estimator_mlp_ratio: 3.0
+
+# ===================== Training Configuration =====================
+training:
+  precision: 16-mixed        # V100/2060: 16-mixed | Ampere+: bf16-mixed
+  epochs: 20
+  gradient_clip: 1.0
+  accumulate_grad_batches: 2
+  val_check_interval: 1000
+  limit_val_batches: 10
+  save_every_n_steps: 2000
+  log_every_n_steps: 10
+  benchmark: true
+
+# ===================== Optimizer Configuration =====================
+optimizer:
+  optimizer_type: adamw
+  learning_rate: 5.0e-5      # S2A LR thấp — chỉ tinh chỉnh prosody
+  weight_decay: 0.01
+  betas: [0.9, 0.98]
+  eps: 1.0e-8
+
+# ===================== Learning Rate Scheduler =====================
+scheduler:
+  scheduler_type: cosine
+  num_warmup_steps: 500
+  num_training_steps: 20000
