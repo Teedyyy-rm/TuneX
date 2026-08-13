@@ -1,0 +1,23 @@
+--- a/confuciustts/cli/inference.py
++++ b/confuciustts/cli/inference.py
+@@ -21,7 +21,7 @@ from confuciustts.flow.flow import MaskedDiffWithXvec, MaskedDiffWithXvecConfig
+ from confuciustts.frontend.text_normalizer import TextNormalizer
+ from confuciustts.llm.llm import Text2Semantic, Text2SemanticConfig
+ from confuciustts.utils.audio_features import mel_spectrogram
+-from confuciustts.utils.audio_post import cross_fade_concat
++from confuciustts.utils.audio_post import cross_fade_concat, fade_and_pad
+ from confuciustts.utils.text_utils import LANGUAGE_TOKEN_MAP
+ 
+ 
+@@ -343,6 +343,11 @@ class ConfuciusTTS:
+             )
+             if audio.dim() == 1:
+                 audio = audio.unsqueeze(0)
++            # ⚠️ Fix "bụp" đầu segment: BigVGAN sinh waveform không từ 0
++            # → fade-in/out ngắn mỗi segment (edge_fade_duration) + pad silence (edge_pad_duration)
++            audio = fade_and_pad(audio, self.sample_rate,
++                                 fade_duration=edge_fade_duration,
++                                 pad_duration=edge_pad_duration)
+             chunks.append(audio)
+ 
+         # Merge segments with cross-fade
