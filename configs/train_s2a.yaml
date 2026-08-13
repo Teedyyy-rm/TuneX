@@ -11,6 +11,7 @@ paths:
   w2v_bert_path: ./pretrained/w2v-bert-2.0
   w2v_stat: ./checkpoints/wav2vec2bert_stats.pt
   t2s_checkpoint: ./checkpoints/t2s_model.safetensors   # frozen backbone
+  s2a_checkpoint: ./checkpoints/s2a_model.pt      # ⚠️ load pretrained S2A (không init mới)
 
   style_encoder:
     target: external.campplus.CAMPPlus
@@ -65,7 +66,7 @@ s2a_model:
 
 # ===================== Training Configuration =====================
 training:
-  precision: 16-mixed        # V100/2060: 16-mixed | Ampere+: bf16-mixed
+  precision: bf16-mixed        # 3090 Ampere — bf16 tensor core
   epochs: 20
   gradient_clip: 1.0
   accumulate_grad_batches: 2
@@ -87,4 +88,4 @@ optimizer:
 scheduler:
   scheduler_type: cosine
   num_warmup_steps: 500
-  num_training_steps: 20000
+  num_training_steps: 13460

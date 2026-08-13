@@ -41,7 +41,7 @@ training:
   precision: bf16-mixed        # RTX 3090 (Ampere) — bf16 tensor core
   epochs: 20                 # finetune 1 giọng: 10-20 epochs đủ
   gradient_clip: 1.0
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2
   val_check_interval: 1000
   limit_val_batches: 10
   save_every_n_steps: 1239  # = 1 epoch
@@ -51,7 +51,7 @@ training:
 # ===================== Optimizer Configuration =====================
 optimizer:
   optimizer_type: adamw
-  learning_rate: 1.0e-4      # finetune LR thấp hơn pretrain (2e-4) — giữ giọng cũ
+  learning_rate: 5.0e-5      # full finetune dataset nhỏ: 2e-5~5e-5 — chống catastrophic forgetting
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1.0e-8
@@ -59,5 +59,5 @@ optimizer:
 # ===================== Learning Rate Scheduler =====================
 scheduler:
   scheduler_type: cosine
-  num_warmup_steps: 500
-  num_training_steps: 20000
+  num_warmup_steps: 1000
+  num_training_steps: 13460

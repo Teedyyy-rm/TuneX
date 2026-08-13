@@ -79,6 +79,10 @@ def main():
     tmp_cfg = Path("/tmp/inference_test_finetuned.yaml")
     tmp_cfg.write_text(yaml.safe_dump(cfg))
 
+    # ⚠️ confuciustts nằm ở /home/obito/projects/Confucius4-TTS (KHÔNG phải repo/ trong TuneX)
+    import sys as _sys
+    _sys.path.insert(0, "/home/obito/projects/Confucius4-TTS")
+
     import torch
     import torchaudio
     from confuciustts.cli.inference import ConfuciusTTS
