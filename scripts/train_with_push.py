@@ -65,9 +65,9 @@ def _handle_line(line: str, LIGHTNING_RE, args, cfg, last_render_step: int, star
         speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
         eta_str = format_seconds(eta_val)
 
-        # Extra loss metrics
+        # Extra loss metrics — T2S: train_loss_step | S2A: train/flow_loss_step
         loss_parts = []
-        lm = re.search(r"train_loss_step=([0-9.]+)", line)
+        lm = re.search(r"(?:train_loss_step|train/flow_loss_step|flow_loss_step|flow_loss)=([0-9.]+)", line)
         if lm: loss_parts.append(f"Loss {lm.group(1)}")
         lg = re.search(r"train_acc_step=([0-9.]+)", line)
         if lg: loss_parts.append(f"Acc {lg.group(1)}")
@@ -106,7 +106,8 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
         ea = EventAccumulator(str(events[-1]), size_guidance={"scalars": 10000})
         ea.Reload()
         tags = ea.Tags().get("scalars", [])
-        loss_tag = next((t for t in tags if t == "train_loss_step"), None)
+        # T2S: train_loss_step | S2A: train/flow_loss_step
+        loss_tag = next((t for t in tags if t in ("train_loss_step", "train/flow_loss_step", "flow_loss_step", "flow_loss")), None)
         if not loss_tag:
             return last_tb_step
         evs = ea.Scalars(loss_tag)
@@ -270,10 +271,11 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     """
     if not ckpt_dir.exists():
         return
-    # Lightning lưu: step_N.ckpt, last.ckpt, epoch=... .ckpt
+    # Lightning lưu: step_N.ckpt, last.ckpt, last-v1.ckpt, epoch=... .ckpt
+    # ⚠️ Aug 13: lọc MỌI file bắt đầu "last" (last.ckpt, last-v1.ckpt...) — trước chỉ lọc "last.ckpt" → push nhầm last-v1!
     ckpts = sorted(
         [p for p in ckpt_dir.rglob("*.ckpt")
-         if not any(x in p.name for x in ("last.ckpt",))],
+         if not p.name.startswith("last")],
         key=lambda p: p.stat().st_mtime,
     )
     if not ckpts:
