@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -223,7 +224,7 @@ def main():
             # Push checkpoint theo step (async — không block training)
             _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
             continue
-        chunk = out.read(4096)
+        chunk = os.read(out.fileno(), 4096) if out else b""  # ⚠️ os.read: trả data CÓ SẴN (FileIO raw vì bufsize=0) — read() block
         if not chunk:
             if out_buf.strip():
                 _handle_line(out_buf.decode("utf-8", errors="replace"), LIGHTNING_RE, args, cfg,
