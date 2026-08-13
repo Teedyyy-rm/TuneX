@@ -50,10 +50,10 @@ def main():
 
     # ── Log UI ──
     log_cfg = cfg.get("logging", {})
-    log_file = log_cfg.get("log_file", "/root/train.log")
+    log_file = log_cfg.get("log_file", "/root/tunex.log")
     from log_ui import init as log_ui_init, log_sys_info, log_gpu_info, log_step_details, format_seconds
     log_ui_init(log_file, ui=log_cfg.get("ui", True))
-    # ⚠️ Relaunch: APPEND separator (KHÔNG rm) — tail -f /root/train.log vẫn follow
+    # ⚠️ Relaunch: APPEND separator (KHÔNG rm) — tail -f /root/tunex.log vẫn follow
     log_restart_separator(f"— {args.stage.upper()} — {Path(args.config).name}")
 
     log_banner("TuneX — Confucius4-TTS Finetune")
@@ -77,6 +77,12 @@ def main():
         shutil.copy2(src, dst)
 
     # Chạy train qua subprocess (tee log)
+    import os as _os
+    _env = dict(_os.environ)
+    # ⚠️ confuciustts nằm trong repo/Confucius4-TTS — cần PYTHONPATH
+    _repo_pkg = ROOT / "repo" / "Confucius4-TTS"
+    if _repo_pkg.exists():
+        _env["PYTHONPATH"] = str(_repo_pkg) + _os.pathsep + _env.get("PYTHONPATH", "")
     if args.stage == "t2s":
         cmd = [str(ROOT / ".venv/bin/python"), "-m", "confuciustts.cli.train_t2s",
                "-c", str(ROOT / "configs" / "train_t2s.yaml")]
@@ -92,22 +98,36 @@ def main():
     log("")
 
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, env=_env)
     pushed: set[str] = set()
     last_step_line = ""
     start_time = time.time()
 
     # Đọc stdout realtime → render UI đẹp + theo dõi checkpoint
     out = proc.stdout or sys.stdout
+    # Lightning progress bar: "Epoch 0:   6%|▌         | 76/1239 [02:28<37:57,  0.51it/s, v_num=2, train_loss_step=7.000, ...]"
+    LIGHTNING_RE = re.compile(
+        r"Epoch (\d+):\s+(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*\[.*?,\s*([0-9.]+)(it/s|s/it),.*?(?:train_loss_step=([0-9.]+))?"
+    )
+    LOG_EVERY = 1  # ⚠️ Teedyy: render MỖI step, nhưng DEDUP — 1 step chỉ render 1 lần (Lightning in 2 dòng/step)
+    last_render_step = -1
     for raw in out:
         line = raw.rstrip("\n")
-        # Bắt dòng Lightning: "Epoch [3/20], Step [340/4189], Mel Loss: ..."
-        m = re.search(r"Epoch \[(\d+)/(\d+)\], Step \[(\d+)/(\d+)\]", line)
+        m = LIGHTNING_RE.search(line)
         if m:
-            ep, ep_total, step, step_total = map(int, m.groups())
-            ep_line = epoch_bar(ep, ep_total, label="EPOCH")
-            st_pct = step / step_total * 100 if step_total else 0
-            
+            ep = int(m.group(1))
+            pct = int(m.group(2))
+            step = int(m.group(3))
+            step_total = int(m.group(4))
+            # ⚠️ Dedup: Lightning in progress bar 2 lần cho cùng step → chỉ render khi step MỚI
+            if step == last_render_step:
+                continue
+            last_render_step = step
+            if step % LOG_EVERY != 0 and step != 0:
+                continue
+            ep_total = int(cfg["training"].get("t2s_epochs" if args.stage == "t2s" else "s2a_epochs", 20))
+            ep_line = epoch_bar(min(ep + 1, ep_total), ep_total, label="EPOCH")
+
             elapsed = time.time() - start_time
             speed_val = step / elapsed if elapsed > 0 else 0
             eta_val = (step_total - step) / speed_val if speed_val > 0 else 0
@@ -116,23 +136,21 @@ def main():
 
             # Extra loss metrics
             loss_parts = []
-            lm = re.search(r"Mel Loss: ([0-9.]+)", line)
-            if lm: loss_parts.append(f"Mel {lm.group(1)}")
-            lg = re.search(r"Gen Loss: ([0-9.]+)", line)
-            if lg: loss_parts.append(f"Gen {lg.group(1)}")
-            ls = re.search(r"SLM Loss: ([0-9.]+)", line)
-            if ls: loss_parts.append(f"SLM {ls.group(1)}")
+            lm = re.search(r"train_loss_step=([0-9.]+)", line)
+            if lm: loss_parts.append(f"Loss {lm.group(1)}")
+            lg = re.search(r"train_acc_step=([0-9.]+)", line)
+            if lg: loss_parts.append(f"Acc {lg.group(1)}")
             loss_info = " | ".join(loss_parts)
 
-            lr_match = re.search(r"lr: ([0-9.e-]+)", line, re.IGNORECASE)
+            lr_match = re.search(r"lr=([0-9.e-]+)", line, re.IGNORECASE)
             lr_str = lr_match.group(1) if lr_match else ""
 
             log(ep_line)
-            log_step_details(step, step_total, pct=st_pct, loss_info=loss_info, lr=lr_str, speed=speed_str, eta=eta_str)
+            log_step_details(step, step_total, pct=pct, loss_info=loss_info, lr=lr_str, speed=speed_str, eta=eta_str)
             last_step_line = line
         else:
-            # Bỏ dòng progress bar trùng lặp của Lightning (100%|...)
-            if "it/s]" in line or "s/it]" in line:
+            # Bỏ progress bar trùng lặp của Lightning (dòng chứa it/s hoặc s/it + %)
+            if re.search(r"\dit/s|\ds/it", line) or ("%" in line and "it/s" in line):
                 continue
             log(line)
 

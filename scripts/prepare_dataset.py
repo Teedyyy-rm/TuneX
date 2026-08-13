@@ -64,6 +64,41 @@ def load_metadata(meta_path: Path) -> list[tuple[str, str]]:
     return rows
 
 
+def extract_semantic_batch(wav_paths: list[Path], processor, w2v, stats, device, batch_sr: int = 16000) -> list[np.ndarray]:
+    """w2v-bert layer 17 batch → normalize → semantic features (chuẩn Confucius4).
+
+    Gom nhiều audio vào 1 forward — nhanh hơn ~10x so với từng mẫu.
+    """
+    from transformers import SeamlessM4TFeatureExtractor, Wav2Vec2BertModel  # noqa
+    import torchaudio.functional as TAF
+
+    sem_mean, sem_std = stats["mean"], torch.sqrt(stats["var"])
+    raw_wavs = []
+    for wav_path in wav_paths:
+        wav, sr = torchaudio.load(str(wav_path))
+        if sr != batch_sr:
+            wav = TAF.resample(wav, sr, batch_sr)
+        raw_wavs.append(wav.squeeze(0).numpy())
+    inputs = processor(raw_wavs, sampling_rate=batch_sr, return_tensors="pt",
+                       padding=True)
+    with torch.no_grad():
+        out_ = w2v(input_features=inputs["input_features"].to(device),
+                   attention_mask=inputs.get("attention_mask").to(device) if inputs.get("attention_mask") is not None else None,
+                   output_hidden_states=True)
+    feats = out_.hidden_states[17].cpu()
+    results = []
+    for i in range(feats.shape[0]):
+        f = feats[i]
+        mask = inputs["attention_mask"][i]
+        n_frames = mask.sum().item()
+        f = f[:n_frames]
+        f = (f - sem_mean) / sem_std
+        ids = f.abs().sum(-1).long().numpy()
+        ids = (ids % 8192).astype(np.int64)
+        results.append(ids)
+    return results
+
+
 def main():
     args = parse_args()
     out = args.out
@@ -107,6 +142,36 @@ def main():
 
     lines = []
     skipped = 0
+    batch: list[Path] = []
+    batch_fnames: list[str] = []
+    batch_texts: list[str] = []
+    batch_langs: list[str] = []
+
+    def flush_batch():
+        nonlocal batch, batch_fnames, batch_texts, batch_langs, skipped
+        if not batch:
+            return
+        try:
+            ids_list = extract_semantic_batch(batch, processor, w2v, stats, device)
+        except Exception as e:
+            print(f"  ⚠️ batch {len(batch)} fail: {e}")
+            skipped += len(batch)
+            batch, batch_fnames, batch_texts, batch_langs = [], [], [], []
+            return
+        for wav_path, fname, text, lang, ids in zip(batch, batch_fnames, batch_texts, batch_langs, ids_list):
+            if len(ids) == 0:
+                skipped += 1
+                continue
+            sid_path = out / "semantic_ids" / f"{Path(fname).stem}.npy"
+            np.save(sid_path, ids)
+            ref_name = Path(fname).stem
+            ref_dst = out / "ref" / f"{ref_name}.wav"
+            if not ref_dst.exists():
+                shutil.copy2(wav_path, ref_dst)
+            lines.append((lang, str(wav_path), text, str(sid_path), str(ref_dst)))
+        batch, batch_fnames, batch_texts, batch_langs = [], [], [], []
+
+    BATCH_SIZE = 16  # w2v-bert batch — GPU 24GB dư tải
     for i, (fname, text) in enumerate(rows):
         wav_path = args.audio_dir / fname
         if not wav_path.exists():
@@ -124,28 +189,24 @@ def main():
             skipped += 1
             continue
 
-        # semantic ids
+        # ⚠️ Resume: bỏ mẫu đã có semantic_ids
         sid_path = out / "semantic_ids" / f"{Path(fname).stem}.npy"
-        try:
-            ids = extract_semantic(wav_path)
-            if len(ids) == 0:
-                skipped += 1
-                continue
-            np.save(sid_path, ids)
-        except Exception as e:
-            print(f"  ⚠️ skip {fname}: {e}")
-            skipped += 1
-            continue
+        if sid_path.exists():
+            ref_dst = out / "ref" / f"{Path(fname).stem}.wav"
+            if ref_dst.exists():
+                lines.append((args.lang, str(wav_path), text, str(sid_path), str(ref_dst)))
+                continue  # đã extract trước — giữ luôn
+            # có npy nhưng thiếu ref → xử lý lại
 
-        # ref audio: copy chính nó (self-reference) — đủ cho 1 giọng
-        ref_name = Path(fname).stem
-        ref_dst = out / "ref" / f"{ref_name}.wav"
-        if not ref_dst.exists():
-            shutil.copy2(wav_path, ref_dst)
-
-        lines.append((args.lang, str(wav_path), text, str(sid_path), str(ref_dst)))
-        if (i + 1) % 50 == 0:
-            print(f"  {i+1}/{len(rows)} ...")
+        batch.append(wav_path)
+        batch_fnames.append(fname)
+        batch_texts.append(text)
+        batch_langs.append(args.lang)
+        if len(batch) >= BATCH_SIZE:
+            flush_batch()
+        if (i + 1) % 200 == 0:
+            print(f"  {i+1}/{len(rows)} ... ({len(lines)} done, {skipped} skip)", flush=True)
+    flush_batch()
 
     if len(lines) < 2:
         raise SystemExit(f"Chỉ {len(lines)} mẫu hợp lệ (skip {skipped}) — cần ≥ 2")
