@@ -39,7 +39,7 @@ def display_width(s: str) -> int:
     return w
 
 
-def init(log_file: str = "/root/train.log", ui: bool = True) -> None:
+def init(log_file: str = "/root/tunex.log", ui: bool = True) -> None:
     """Khởi tạo log file. KHÔNG rm — mở append (giữ tail -f follow)."""
     global _LOG_FILE
     if not ui:

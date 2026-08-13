@@ -17,7 +17,7 @@ datasets:
 hf:
   repo_id: "Teedyyy-rm/Confucius4-storycast"
   private: true
-  push_every_steps: 2000          # push checkpoint mỗi N steps (Stage 1 + 2)
+  push_every_steps: 1239          # = 1 epoch — push mỗi epoch (Teedyy)
   push_every_epochs: 1            # push theo epoch (nếu train có epoch tracking)
   token_file: "~/.cache/huggingface/token"   # nguồn token HF
 
@@ -30,10 +30,12 @@ prepare:
   prompt_sr: 16000                # w2v-bert
   ref_keep: 2
 
-# ── Log UI (tail -f /root/train.log theo dõi trực quan) ──
+# ── Log UI (tail -f /root/tunex.log theo dõi TRỌN quá trình) ──
+# ⚠️ Teedyy Aug 13: MỌI task (prepare/train/download) ghi VÀO /root/tunex.log
+# KHÔNG tạo đường dẫn log nào khác. Reload/restart → append separator (không rm).
 logging:
   ui: true
-  log_file: "/root/train.log"     # ⚠️ KHÔNG rm khi relaunch — append (tail -f giữ follow)
+  log_file: "/root/tunex.log"
 
 # ── Training (ghi đè configs/*.yaml khi setup) ──
 training:
