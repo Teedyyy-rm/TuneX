@@ -20,7 +20,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from log_ui import log, log_banner, log_section, log_table, log_restart_separator, epoch_bar, progress_bar  # noqa: E402
+from log_ui import log, log_banner, log_section, log_table, log_restart_separator, epoch_bar, progress_bar, format_seconds, log_step_details  # noqa: E402
 
 
 def parse_args():
@@ -40,6 +40,102 @@ def _gpu_name() -> str:
         return r.stdout.strip() or "-"
     except Exception:
         return "-"
+
+
+def _handle_line(line: str, LIGHTNING_RE, args, cfg, last_render_step: int, start_time: float) -> int:
+    """Xử lý 1 dòng stdout → render UI. Trả về last_render_step mới."""
+    from log_ui import log, epoch_bar, log_step_details  # noqa: F401
+    m = LIGHTNING_RE.search(line)
+    if m:
+        ep = int(m.group(1))
+        pct = int(m.group(2))
+        step = int(m.group(3))
+        step_total = int(m.group(4))
+        # ⚠️ Dedup: Lightning in progress bar 2 lần cho cùng step → chỉ render khi step MỚI
+        if step == last_render_step:
+            return last_render_step
+        last_render_step = step
+        ep_total = int(cfg["training"].get("t2s_epochs" if args.stage == "t2s" else "s2a_epochs", 20))
+        ep_line = epoch_bar(min(ep + 1, ep_total), ep_total, label="EPOCH")
+
+        elapsed = time.time() - start_time
+        speed_val = step / elapsed if elapsed > 0 else 0
+        eta_val = (step_total - step) / speed_val if speed_val > 0 else 0
+        speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
+        eta_str = format_seconds(eta_val)
+
+        # Extra loss metrics
+        loss_parts = []
+        lm = re.search(r"train_loss_step=([0-9.]+)", line)
+        if lm: loss_parts.append(f"Loss {lm.group(1)}")
+        lg = re.search(r"train_acc_step=([0-9.]+)", line)
+        if lg: loss_parts.append(f"Acc {lg.group(1)}")
+        loss_info = " | ".join(loss_parts)
+
+        lr_match = re.search(r"lr=([0-9.e-]+)", line, re.IGNORECASE)
+        lr_str = lr_match.group(1) if lr_match else ""
+
+        log(ep_line)
+        log_step_details(step, step_total, pct=pct, loss_info=loss_info, lr=lr_str, speed=speed_str, eta=eta_str)
+    else:
+        # Bỏ progress bar trùng lặp của Lightning (dòng chứa it/s hoặc s/it + %)
+        if re.search(r"\dit/s|\ds/it", line) or ("%" in line and "it/s" in line):
+            return last_render_step
+        log(line)
+    return last_render_step
+
+
+def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: float) -> int:
+    """Đọc TensorBoard events (Lightning luôn ghi train_loss_step mỗi step).
+
+    Dùng khi stdout im lặng (Rich progress bar tắt khi non-TTY sau resume).
+    Trả về step mới nhất đã render.
+    """
+    from log_ui import log, epoch_bar, log_step_details  # noqa: F401
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        events = sorted(
+            (ckpt_dir / "t2s_training").glob("version_*/events.out.tfevents.*")
+            if (ckpt_dir / "t2s_training").exists()
+            else ckpt_dir.glob("events.out.tfevents.*"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not events:
+            return last_tb_step
+        ea = EventAccumulator(str(events[-1]), size_guidance={"scalars": 10000})
+        ea.Reload()
+        tags = ea.Tags().get("scalars", [])
+        loss_tag = next((t for t in tags if t == "train_loss_step"), None)
+        if not loss_tag:
+            return last_tb_step
+        evs = ea.Scalars(loss_tag)
+        if not evs:
+            return last_tb_step
+        e = evs[-1]
+        if e.step <= last_tb_step:
+            return last_tb_step
+        last_tb_step = e.step
+
+        step_total = 1239
+        ep_total = int(cfg["training"].get("t2s_epochs" if args.stage == "t2s" else "s2a_epochs", 20))
+        ep = e.step // step_total
+        pct = int((e.step % step_total) / step_total * 100) if step_total else 0
+        log(epoch_bar(min(ep + 1, ep_total), ep_total, label="EPOCH"))
+        loss_parts = [f"Loss {e.value:.4f}"]
+        acc_tag = next((t for t in tags if t == "train_acc_step"), None)
+        if acc_tag:
+            a = ea.Scalars(acc_tag)[-1]
+            loss_parts.append(f"Acc {a.value:.4f}")
+        elapsed = time.time() - start_time
+        speed_val = e.step / elapsed if elapsed > 0 else 0
+        speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
+        eta_val = (step_total - e.step % step_total) / speed_val if speed_val > 0 else 0
+        log_step_details(e.step % step_total or step_total, step_total, pct=pct,
+                         loss_info=" | ".join(loss_parts), lr="", speed=speed_str,
+                         eta=format_seconds(eta_val))
+    except Exception as ex:
+        log(f"⚠️ TB poll: {ex}")
+    return last_tb_step
 
 
 def main():
@@ -98,66 +194,62 @@ def main():
     log("")
 
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1, env=_env)
+                            bufsize=0, env=_env)  # ⚠️ binary mode — đọc chunk bytes, tách \r/\n
     pushed: set[str] = set()
+    pushing: set[str] = set()
     last_step_line = ""
     start_time = time.time()
 
     # Đọc stdout realtime → render UI đẹp + theo dõi checkpoint
-    out = proc.stdout or sys.stdout
-    # Lightning progress bar: "Epoch 0:   6%|▌         | 76/1239 [02:28<37:57,  0.51it/s, v_num=2, train_loss_step=7.000, ...]"
+    # ⚠️ Aug 13: đọc BINARY + tách cả \r (Lightning progress bar dùng \r, không \n
+    # sau resume từ last.ckpt → readline() kẹt mãi → log đứng, GPU vẫn chạy)
     LIGHTNING_RE = re.compile(
         r"Epoch (\d+):\s+(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*\[.*?,\s*([0-9.]+)(it/s|s/it),.*?(?:train_loss_step=([0-9.]+))?"
     )
     LOG_EVERY = 1  # ⚠️ Teedyy: render MỖI step, nhưng DEDUP — 1 step chỉ render 1 lần (Lightning in 2 dòng/step)
     last_render_step = -1
-    for raw in out:
-        line = raw.rstrip("\n")
-        m = LIGHTNING_RE.search(line)
-        if m:
-            ep = int(m.group(1))
-            pct = int(m.group(2))
-            step = int(m.group(3))
-            step_total = int(m.group(4))
-            # ⚠️ Dedup: Lightning in progress bar 2 lần cho cùng step → chỉ render khi step MỚI
-            if step == last_render_step:
-                continue
-            last_render_step = step
-            if step % LOG_EVERY != 0 and step != 0:
-                continue
-            ep_total = int(cfg["training"].get("t2s_epochs" if args.stage == "t2s" else "s2a_epochs", 20))
-            ep_line = epoch_bar(min(ep + 1, ep_total), ep_total, label="EPOCH")
 
-            elapsed = time.time() - start_time
-            speed_val = step / elapsed if elapsed > 0 else 0
-            eta_val = (step_total - step) / speed_val if speed_val > 0 else 0
-            speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
-            eta_str = format_seconds(eta_val)
-
-            # Extra loss metrics
-            loss_parts = []
-            lm = re.search(r"train_loss_step=([0-9.]+)", line)
-            if lm: loss_parts.append(f"Loss {lm.group(1)}")
-            lg = re.search(r"train_acc_step=([0-9.]+)", line)
-            if lg: loss_parts.append(f"Acc {lg.group(1)}")
-            loss_info = " | ".join(loss_parts)
-
-            lr_match = re.search(r"lr=([0-9.e-]+)", line, re.IGNORECASE)
-            lr_str = lr_match.group(1) if lr_match else ""
-
-            log(ep_line)
-            log_step_details(step, step_total, pct=pct, loss_info=loss_info, lr=lr_str, speed=speed_str, eta=eta_str)
-            last_step_line = line
-        else:
-            # Bỏ progress bar trùng lặp của Lightning (dòng chứa it/s hoặc s/it + %)
-            if re.search(r"\dit/s|\ds/it", line) or ("%" in line and "it/s" in line):
-                continue
-            log(line)
-
-        # Push checkpoint theo step
-        _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed)
+    out_buf = b""
+    out = proc.stdout
+    import select
+    last_tb_poll = 0.0
+    last_tb_step = -1
+    while True:
+        # ⚠️ Đọc stdout với timeout — nếu Lightning im lặng (Rich non-TTY sau resume)
+        # thì poll TensorBoard events (nguồn loss/step LUÔN có)
+        rlist, _, _ = select.select([out], [], [], 10)
+        if not rlist:
+            last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time)
+            # Push checkpoint theo step (async — không block training)
+            _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
+            continue
+        chunk = out.read(4096)
+        if not chunk:
+            if out_buf.strip():
+                _handle_line(out_buf.decode("utf-8", errors="replace"), LIGHTNING_RE, args, cfg,
+                             last_render_step, start_time)
+            break
+        out_buf += chunk
+        # Tách theo \n hoặc \r — progress bar update bằng \r
+        while b"\n" in out_buf or b"\r" in out_buf:
+            nl = out_buf.find(b"\n")
+            cr = out_buf.find(b"\r")
+            if nl == -1:
+                idx = cr + 1
+            elif cr == -1:
+                idx = nl + 1
+            else:
+                idx = min(nl, cr) + 1
+            raw_line = out_buf[:idx]
+            out_buf = out_buf[idx:]
+            last_render_step = _handle_line(
+                raw_line.decode("utf-8", errors="replace").rstrip("\r\n"),
+                LIGHTNING_RE, args, cfg, last_render_step, start_time,
+            )
+        # Push checkpoint theo step (async — không block training)
+        _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
     proc.wait()
-    _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed)
+    _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
 
     rc = proc.returncode
     log_section(3, 3, "KẾT THÚC")
@@ -169,8 +261,12 @@ def main():
     sys.exit(rc)
 
 
-def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushed: set):
-    """Push checkpoint mới nhất chưa push (theo step number trong tên)."""
+def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushed: set, pushing: set):
+    """Push checkpoint mới nhất chưa push (theo step number trong tên).
+
+    ⚠️ Aug 13: chạy ASYNC (thread) — push 6.5GB mất 10-20 phút, nếu đồng bộ
+    sẽ block vòng đọc stdout → training nghẹt (pipe đầy, GPU 0%).
+    """
     if not ckpt_dir.exists():
         return
     # Lightning lưu: step_N.ckpt, last.ckpt, epoch=... .ckpt
@@ -182,7 +278,7 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     if not ckpts:
         return
     latest = ckpts[-1]
-    if str(latest) in pushed:
+    if str(latest) in pushed or str(latest) in pushing:
         return
 
     # Lấy step từ tên file (step_000123.ckpt | epoch=1-step=123.ckpt)
@@ -192,18 +288,30 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     if step and step % push_every != 0:
         return  # chưa tới mốc push
 
-    print(f"📤 Push {latest.name} → HF ({hf_cfg.get('repo_id')})...", flush=True)
-    r = subprocess.run(
-        [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts" / "push_checkpoint.py"),
-         "--stage", stage, "--file", str(latest), "--step", str(step),
-         "--config", str(ROOT / "config.yaml")],
-        capture_output=True, text=True, timeout=300,
-    )
-    if r.returncode == 0:
-        pushed.add(str(latest))
-        print(f"✅ {r.stdout.strip().splitlines()[-1]}", flush=True)
-    else:
-        print(f"⚠️ Push fail: {r.stderr[-300:]}", flush=True)
+    pushing.add(str(latest))
+    log(f"📤 Push {latest.name} → HF ({hf_cfg.get('repo_id')})... (async)")
+
+    def _do_push():
+        import traceback
+        try:
+            r = subprocess.run(
+                [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts" / "push_checkpoint.py"),
+                 "--stage", stage, "--file", str(latest), "--step", str(step),
+                 "--config", str(ROOT / "config.yaml")],
+                capture_output=True, text=True, timeout=3600,  # 6.5GB cần 10-20 phút
+            )
+            if r.returncode == 0:
+                pushed.add(str(latest))
+                log(f"✅ {r.stdout.strip().splitlines()[-1]}")
+            else:
+                log(f"⚠️ Push fail: {r.stderr[-300:]}")
+        except Exception as e:
+            log(f"⚠️ Push exception: {e}")
+        finally:
+            pushing.discard(str(latest))
+
+    import threading
+    threading.Thread(target=_do_push, daemon=True).start()
 
 
 if __name__ == "__main__":

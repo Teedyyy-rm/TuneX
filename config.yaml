@@ -17,7 +17,7 @@ datasets:
 hf:
   repo_id: "Teedyyy-rm/Confucius4-storycast"
   private: true
-  push_every_steps: 2000          # push checkpoint mỗi N steps (Stage 1 + 2)
+  push_every_steps: 1239          # = 1 epoch — push mỗi epoch (Teedyy)
   push_every_epochs: 1            # push theo epoch (nếu train có epoch tracking)
   token_file: "~/.cache/huggingface/token"   # nguồn token HF
 
