@@ -17,7 +17,7 @@ datasets:
 hf:
   repo_id: "Teedyyy-rm/Confucius4-storycast"
   private: true
-  push_every_steps: 1239          # = 1 epoch — push mỗi epoch (Teedyy)
+  push_every_steps: 620          # = 1 epoch optimizer steps (accumulate 2: 1239/2) — push mỗi epoch (Teedyy)
   push_every_epochs: 1            # push theo epoch (nếu train có epoch tracking)
   token_file: "~/.cache/huggingface/token"   # nguồn token HF
 
@@ -42,7 +42,7 @@ training:
   t2s_epochs: 20
   s2a_epochs: 20
   batch_size: 8                   # 16GB: 4-8 | 24GB: 8-16 | 32GB: 16-32
-  precision: "16-mixed"           # V100/2060: 16-mixed | Ampere+: bf16-mixed
+  precision: "bf16-mixed"         # 3090 Ampere — bf16 tensor core
   accumulate_grad_batches: 2
-  learning_rate_t2s: 1.0e-4
+  learning_rate_t2s: 5.0e-5       # full finetune dataset nhỏ — chống catastrophic forgetting
   learning_rate_s2a: 5.0e-5

@@ -26,7 +26,7 @@ data:
     - ./data/processed/train.tsv
   val_data_path:
     - ./data/processed/val.tsv
-  batch_size: 8              # S2A nhẹ hơn T2S — batch cao hơn
+  batch_size: 12             # 24GB — batch 16 OOM ở seq dài (S2A)
   num_workers: 8
   max_text_seq_len: 520
   max_semantic_seq_len: 1520
@@ -72,7 +72,7 @@ training:
   accumulate_grad_batches: 2
   val_check_interval: 1000
   limit_val_batches: 10
-  save_every_n_steps: 2000
+  save_every_n_steps: 413   # = 1 epoch (826 data steps / 2 accumulate)
   log_every_n_steps: 10
   benchmark: true
 
@@ -88,4 +88,4 @@ optimizer:
 scheduler:
   scheduler_type: cosine
   num_warmup_steps: 500
-  num_training_steps: 13460
+  num_training_steps: 8260   # 413 opt steps x 20 epochs
