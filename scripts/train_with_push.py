@@ -233,6 +233,9 @@ def main():
             pass
     last_step_line = ""
     start_time = time.time()
+    # ⚠️ Aug 15: chỉ poll TB khi stdout IM LẶNG (không render step mới ≥ 60s).
+    # Trước đó poll định kỳ 30s → stdout parser + TB poll render CÙNG step → log in 2 lần (Teedyy báo)
+    last_stdout_render = time.time()
 
     # Đọc stdout realtime → render UI đẹp + theo dõi checkpoint
     # ⚠️ Aug 13: đọc BINARY + tách cả \r (Lightning progress bar dùng \r, không \n
@@ -252,17 +255,17 @@ def main():
         # ⚠️ Đọc stdout với timeout — nếu Lightning im lặng (Rich non-TTY sau resume)
         # thì poll TensorBoard events (nguồn loss/step LUÔN có)
         rlist, _, _ = select.select([out], [], [], 10)
-        # ⚠️⚠️ Aug 15: poll TB ĐỊNH KỲ 30s bất kể stdout có data hay không —
-        # sau resume Lightning in progress bar "0/?" bằng \r liên tục → select LUÔN
-        # có data → không bao giờ timeout → TB poll không chạy → log đứng (GPU vẫn 100%)
+        # ⚠️⚠️ Aug 15: poll TB CHỈ khi stdout im lặng ≥ 60s (không render step mới).
+        # stdout parser render chuẩn 1 lần/step; TB poll chỉ là fallback khi resume "0/?"
+        # Trước đó poll định kỳ 30s → CÙNG step render 2 lần (Teedyy báo "in ra 2 lần")
         now = time.time()
-        if not rlist or (now - last_tb_poll > 30):
+        if now - last_stdout_render > 60:
             last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time, resume_base)
-            last_tb_poll = now
+            last_stdout_render = now  # reset — không poll lại ngay
             # Push checkpoint theo step (async — không block training)
             _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
-            if not rlist:
-                continue
+        if not rlist:
+            continue
         chunk = os.read(out.fileno(), 4096) if out else b""  # ⚠️ os.read: trả data CÓ SẴN (FileIO raw vì bufsize=0) — read() block
         if not chunk:
             if out_buf.strip():
@@ -282,10 +285,14 @@ def main():
                 idx = min(nl, cr) + 1
             raw_line = out_buf[:idx]
             out_buf = out_buf[idx:]
+            _prev_step = last_render_step
             last_render_step = _handle_line(
                 raw_line.decode("utf-8", errors="replace").rstrip("\r\n"),
                 LIGHTNING_RE, args, cfg, last_render_step, start_time,
             )
+            # stdout đang render step mới → hoãn TB poll (tránh in 2 lần cùng step)
+            if last_render_step != _prev_step:
+                last_stdout_render = time.time()
         # Push checkpoint theo step (async — không block training)
         _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
     proc.wait()
