@@ -60,4 +60,4 @@ optimizer:
 scheduler:
   scheduler_type: cosine
   num_warmup_steps: 1000
-  num_training_steps: 12390  # 620 opt steps x 20 epochs
+  num_training_steps: 12400  # 620 opt steps x 20 epochs
