@@ -86,7 +86,7 @@ def _handle_line(line: str, LIGHTNING_RE, args, cfg, last_render_step: int, star
     return last_render_step
 
 
-def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: float) -> int:
+def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: float, resume_base: int = 0) -> int:
     """Đọc TensorBoard events (Lightning luôn ghi train_loss_step mỗi step).
 
     Dùng khi stdout im lặng (Rich progress bar tắt khi non-TTY sau resume).
@@ -94,6 +94,7 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
     """
     from log_ui import log, epoch_bar, log_step_details  # noqa: F401
     try:
+        import yaml as _yaml
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
         events = sorted(
             (ckpt_dir / "t2s_training").glob("version_*/events.out.tfevents.*")
@@ -118,9 +119,15 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
             return last_tb_step
         last_tb_step = e.step
 
-        step_total = 1239
+        # ⚠️ step_total = save_every_n_steps THẬT từ config (T2S 620 / S2A 413 — optimizer steps)
+        stage_yaml = ROOT / "configs" / ("train_t2s.yaml" if args.stage == "t2s" else "train_s2a.yaml")
+        try:
+            step_total = int(_yaml.safe_load(stage_yaml.read_text(encoding="utf-8"))["training"]["save_every_n_steps"])
+        except Exception:
+            step_total = 620 if args.stage == "t2s" else 413
         ep_total = int(cfg["training"].get("t2s_epochs" if args.stage == "t2s" else "s2a_epochs", 20))
-        ep = e.step // step_total
+        total_steps = step_total * ep_total
+        ep = e.step // step_total  # global_step / steps-per-epoch → epoch index thật
         pct = int((e.step % step_total) / step_total * 100) if step_total else 0
         log(epoch_bar(min(ep + 1, ep_total), ep_total, label="EPOCH"))
         loss_parts = [f"Loss {e.value:.4f}"]
@@ -129,10 +136,13 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
             a = ea.Scalars(acc_tag)[-1]
             loss_parts.append(f"Acc {a.value:.4f}")
         elapsed = time.time() - start_time
-        speed_val = e.step / elapsed if elapsed > 0 else 0
+        # ⚠️ Speed tính theo steps MỚI (trừ resume_base) — không tính 3720 steps cũ
+        new_steps = max(e.step - resume_base, 0)
+        speed_val = new_steps / elapsed if elapsed > 0 else 0
         speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
-        eta_val = (step_total - e.step % step_total) / speed_val if speed_val > 0 else 0
-        log_step_details(e.step % step_total or step_total, step_total, pct=pct,
+        eta_val = (total_steps - e.step) / speed_val if speed_val > 0 else 0
+        # ⚠️ Hiển thị step GLOBAL thật (vd 3799/12390) — không modulo theo epoch
+        log_step_details(e.step, total_steps, pct=pct,
                          loss_info=" | ".join(loss_parts), lr="", speed=speed_str,
                          eta=format_seconds(eta_val))
     except Exception as ex:
@@ -198,7 +208,29 @@ def main():
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             bufsize=0, env=_env)  # ⚠️ binary mode — đọc chunk bytes, tách \r/\n
     pushed: set[str] = set()
+    # ⚠️ Aug 15: file ckpt CÓ SẴN lúc launch (resume source tải từ HF, đã push ở run trước)
+    # → thêm vào pushed ngay — tránh push lại 6.5GB mỗi restart
+    # ⚠️⚠️ Dedup theo STEP NUMBER (không theo path): Lightning khi start tạo
+    # step_000003720.ckpt (9 số) — cùng step 3720, content giống step_0003720.ckpt đã push
+    if ckpt_dir.exists():
+        for p in ckpt_dir.rglob("*.ckpt"):
+            if not p.name.startswith("last"):
+                pushed.add(str(p))
+    pushed_steps: set[int] = set()
+    for p in list(pushed):
+        m = re.search(r"step[=_-](\d+)", Path(p).name)
+        if m:
+            pushed_steps.add(int(m.group(1)))
     pushing: set[str] = set()
+    # ⚠️ resume_base = global_step từ ckpt có sẵn (resume source) — để tính speed steps MỚI
+    resume_base = 0
+    for p in list(pushed):
+        try:
+            import torch as _torch
+            ck = _torch.load(str(p), map_location="cpu")
+            resume_base = max(resume_base, int(ck.get("global_step", 0)))
+        except Exception:
+            pass
     last_step_line = ""
     start_time = time.time()
 
@@ -220,11 +252,17 @@ def main():
         # ⚠️ Đọc stdout với timeout — nếu Lightning im lặng (Rich non-TTY sau resume)
         # thì poll TensorBoard events (nguồn loss/step LUÔN có)
         rlist, _, _ = select.select([out], [], [], 10)
-        if not rlist:
-            last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time)
+        # ⚠️⚠️ Aug 15: poll TB ĐỊNH KỲ 30s bất kể stdout có data hay không —
+        # sau resume Lightning in progress bar "0/?" bằng \r liên tục → select LUÔN
+        # có data → không bao giờ timeout → TB poll không chạy → log đứng (GPU vẫn 100%)
+        now = time.time()
+        if not rlist or (now - last_tb_poll > 30):
+            last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time, resume_base)
+            last_tb_poll = now
             # Push checkpoint theo step (async — không block training)
-            _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
-            continue
+            _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
+            if not rlist:
+                continue
         chunk = os.read(out.fileno(), 4096) if out else b""  # ⚠️ os.read: trả data CÓ SẴN (FileIO raw vì bufsize=0) — read() block
         if not chunk:
             if out_buf.strip():
@@ -249,9 +287,9 @@ def main():
                 LIGHTNING_RE, args, cfg, last_render_step, start_time,
             )
         # Push checkpoint theo step (async — không block training)
-        _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
+        _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
     proc.wait()
-    _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing)
+    _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
 
     rc = proc.returncode
     log_section(3, 3, "KẾT THÚC")
@@ -263,7 +301,7 @@ def main():
     sys.exit(rc)
 
 
-def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushed: set, pushing: set):
+def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushed: set, pushing: set, pushed_steps: set = None):
     """Push checkpoint mới nhất chưa push (theo step number trong tên).
 
     ⚠️ Aug 13: chạy ASYNC (thread) — push 6.5GB mất 10-20 phút, nếu đồng bộ
@@ -271,6 +309,8 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     """
     if not ckpt_dir.exists():
         return
+    if pushed_steps is None:
+        pushed_steps = set()
     # Lightning lưu: step_N.ckpt, last.ckpt, last-v1.ckpt, epoch=... .ckpt
     # ⚠️ Aug 13: lọc MỌI file bắt đầu "last" (last.ckpt, last-v1.ckpt...) — trước chỉ lọc "last.ckpt" → push nhầm last-v1!
     ckpts = sorted(
@@ -290,6 +330,9 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     step = int(m.group(1)) if m else 0
     if step and step % push_every != 0:
         return  # chưa tới mốc push
+    if step and step in pushed_steps:
+        pushed.add(str(latest))  # đánh dấu đã push — không push lại bản trùng step
+        return
 
     pushing.add(str(latest))
     log(f"📤 Push {latest.name} → HF ({hf_cfg.get('repo_id')})... (async)")
