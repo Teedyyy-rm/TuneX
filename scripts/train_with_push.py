@@ -100,9 +100,12 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
     try:
         import yaml as _yaml
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+        # ⚠️ Aug 15: T2S dùng t2s_training, S2A dùng s2a_training (train_s2a.py:71) —
+        # hardcode "t2s_training" → TB poll S2A không thấy events → log UI đứng
+        tb_sub = "t2s_training" if args.stage == "t2s" else "s2a_training"
         events = sorted(
-            (ckpt_dir / "t2s_training").glob("version_*/events.out.tfevents.*")
-            if (ckpt_dir / "t2s_training").exists()
+            (ckpt_dir / tb_sub).glob("version_*/events.out.tfevents.*")
+            if (ckpt_dir / tb_sub).exists()
             else ckpt_dir.glob("events.out.tfevents.*"),
             key=lambda p: p.stat().st_mtime,
         )
@@ -175,6 +178,17 @@ def main():
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     hf_cfg = cfg.get("hf", {})
     push_every = args.push_every_steps or hf_cfg.get("push_every_steps", 2000)
+    # ⚠️⚠️ Aug 15 (Teedyy phát hiện S2A không push): push_every PHẢI = save_every_n_steps
+    # của STAGE (T2S 620 / S2A 413). config.yaml push_every_steps=620 là của T2S →
+    # S2A mốc 413%620≠0 → không bao giờ chạm mốc → ckpt e1 lưu nhưng KHÔNG push.
+    try:
+        import yaml as _yaml
+        _stage_yaml = _yaml.safe_load(
+            (ROOT / "configs" / ("train_t2s.yaml" if args.stage == "t2s" else "train_s2a.yaml"))
+            .read_text(encoding="utf-8"))
+        push_every = int(_stage_yaml["training"]["save_every_n_steps"])
+    except Exception:
+        pass  # giữ giá trị config.yaml nếu không đọc được
 
     # ── Log UI ──
     log_cfg = cfg.get("logging", {})
@@ -228,14 +242,21 @@ def main():
     proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             bufsize=0, env=_env)  # ⚠️ binary mode — đọc chunk bytes, tách \r/\n
     pushed: set[str] = set()
-    # ⚠️ Aug 15: file ckpt CÓ SẴN lúc launch (resume source tải từ HF, đã push ở run trước)
-    # → thêm vào pushed ngay — tránh push lại 6.5GB mỗi restart
+    # ⚠️⚠️ Aug 15 (fix lần 2 — S2A e1 vẫn không push): pre-mark pushed = file ĐÃ CÓ
+    # trên HF (gọi API thật) — KHÔNG phải file tồn tại local. Fix trước mark "file có
+    # sẵn lúc launch" = đã push → S2A step_000000413.ckpt (tồn tại local nhưng CHƯA
+    # push) bị bỏ qua vĩnh viễn (Teedyy phát hiện e1 không lên HF).
+    try:
+        from huggingface_hub import HfApi
+        _tok = open(os.path.expanduser(hf_cfg.get("token_file", "~/.cache/huggingface/token"))).read().strip()
+        _existing = set(HfApi(token=_tok).list_repo_files(hf_cfg.get("repo_id", ""), repo_type="model", token=_tok))
+        for _p in ckpt_dir.rglob("*.ckpt"):
+            if _p.name in _existing:
+                pushed.add(str(_p))
+    except Exception:
+        pass  # API fail → không pre-mark → push hết (an toàn hơn thiếu)
     # ⚠️⚠️ Dedup theo STEP NUMBER (không theo path): Lightning khi start tạo
     # step_000003720.ckpt (9 số) — cùng step 3720, content giống step_0003720.ckpt đã push
-    if ckpt_dir.exists():
-        for p in ckpt_dir.rglob("*.ckpt"):
-            if not p.name.startswith("last"):
-                pushed.add(str(p))
     pushed_steps: set[int] = set()
     for p in list(pushed):
         m = re.search(r"step[=_-](\d+)", Path(p).name)
@@ -349,44 +370,47 @@ def _maybe_push(ckpt_dir: Path, stage: str, hf_cfg: dict, push_every: int, pushe
     )
     if not ckpts:
         return
-    latest = ckpts[-1]
-    if str(latest) in pushed or str(latest) in pushing:
-        return
+    # ⚠️⚠️ Aug 15: quét TẤT CẢ file chưa push (không chỉ latest theo mtime) —
+    # restart resume từ step giữa mốc (vd 500) làm file mốc cũ (413) không bao giờ
+    # là latest → KHÔNG push (Teedyy phát hiện S2A e1 không lên HF)
+    for latest in ckpts:
+        if str(latest) in pushed or str(latest) in pushing:
+            continue
+        # Lấy step từ tên file (step_000123.ckpt | epoch=1-step=123.ckpt)
+        import re
+        m = re.search(r"step[=_-](\d+)", latest.name)
+        step = int(m.group(1)) if m else 0
+        if step and step % push_every != 0:
+            continue  # chưa tới mốc push
+        if step and step in pushed_steps:
+            pushed.add(str(latest))  # đánh dấu đã push — không push lại bản trùng step
+            continue
 
-    # Lấy step từ tên file (step_000123.ckpt | epoch=1-step=123.ckpt)
-    import re
-    m = re.search(r"step[=_-](\d+)", latest.name)
-    step = int(m.group(1)) if m else 0
-    if step and step % push_every != 0:
-        return  # chưa tới mốc push
-    if step and step in pushed_steps:
-        pushed.add(str(latest))  # đánh dấu đã push — không push lại bản trùng step
-        return
+        pushing.add(str(latest))
+        log(f"📤 Push {latest.name} → HF ({hf_cfg.get('repo_id')})... (async)")
 
-    pushing.add(str(latest))
-    log(f"📤 Push {latest.name} → HF ({hf_cfg.get('repo_id')})... (async)")
+        def _do_push(_latest=latest, _step=step):
+            import traceback
+            try:
+                r = subprocess.run(
+                    [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts" / "push_checkpoint.py"),
+                     "--stage", stage, "--file", str(_latest), "--step", str(_step),
+                     "--config", str(ROOT / "config.yaml")],
+                    capture_output=True, text=True, timeout=3600,  # 6.5GB cần 10-20 phút
+                )
+                if r.returncode == 0:
+                    pushed.add(str(_latest))
+                    log(f"✅ {r.stdout.strip().splitlines()[-1]}")
+                else:
+                    log(f"⚠️ Push fail: {r.stderr[-300:]}")
+            except Exception as e:
+                log(f"⚠️ Push exception: {e}")
+            finally:
+                pushing.discard(str(_latest))
 
-    def _do_push():
-        import traceback
-        try:
-            r = subprocess.run(
-                [str(ROOT / ".venv/bin/python"), str(ROOT / "scripts" / "push_checkpoint.py"),
-                 "--stage", stage, "--file", str(latest), "--step", str(step),
-                 "--config", str(ROOT / "config.yaml")],
-                capture_output=True, text=True, timeout=3600,  # 6.5GB cần 10-20 phút
-            )
-            if r.returncode == 0:
-                pushed.add(str(latest))
-                log(f"✅ {r.stdout.strip().splitlines()[-1]}")
-            else:
-                log(f"⚠️ Push fail: {r.stderr[-300:]}")
-        except Exception as e:
-            log(f"⚠️ Push exception: {e}")
-        finally:
-            pushing.discard(str(latest))
-
-    import threading
-    threading.Thread(target=_do_push, daemon=True).start()
+        import threading
+        threading.Thread(target=_do_push, daemon=True).start()
+    return
 
 
 if __name__ == "__main__":
