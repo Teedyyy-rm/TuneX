@@ -86,11 +86,15 @@ def _handle_line(line: str, LIGHTNING_RE, args, cfg, last_render_step: int, star
     return last_render_step
 
 
-def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: float, resume_base: int = 0) -> int:
+def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: float, resume_base: int = 0, speed_state: dict = None) -> int:
     """Đọc TensorBoard events (Lightning luôn ghi train_loss_step mỗi step).
 
     Dùng khi stdout im lặng (Rich progress bar tắt khi non-TTY sau resume).
     Trả về step mới nhất đã render.
+
+    ⚠️ Aug 15 (Teedyy báo ETA sai): speed tính theo DELTA giữa 2 lần poll
+    (speed_state) — KHÔNG dùng elapsed từ start (bao gồm thời gian load model
+    ~2 phút chưa train → speed thấp → ETA phóng đại 15h thay vì ~6h).
     """
     from log_ui import log, epoch_bar, log_step_details  # noqa: F401
     try:
@@ -136,9 +140,25 @@ def _poll_tensorboard(ckpt_dir: Path, args, cfg, last_tb_step: int, start_time: 
             a = ea.Scalars(acc_tag)[-1]
             loss_parts.append(f"Acc {a.value:.4f}")
         elapsed = time.time() - start_time
-        # ⚠️ Speed tính theo steps MỚI (trừ resume_base) — không tính 3720 steps cũ
-        new_steps = max(e.step - resume_base, 0)
-        speed_val = new_steps / elapsed if elapsed > 0 else 0
+        # ⚠️⚠️ Aug 15 (ETA sai): speed theo DELTA cửa sổ ≥5 steps (anchor) — KHÔNG dùng
+        # elapsed từ start (gồm ~2 phút load model chưa train → ETA phóng đại).
+        # Cửa sổ 5 steps → ổn định hơn delta 1-step/3s (nhiễu). Lần đầu chỉ seed.
+        now_t = time.time()
+        if speed_state is not None and speed_state.get("seeded"):
+            d_steps = e.step - speed_state.get("step", e.step)
+            d_time = now_t - speed_state.get("t", now_t)
+            if d_steps >= 5 and d_time > 1:
+                speed_val = d_steps / d_time
+                # cập nhật anchor — chỉ khi đủ 5 steps mới
+                speed_state.update(step=e.step, t=now_t)
+            else:
+                speed_val = speed_state.get("last_speed", 0.0)  # giữ speed cũ nếu chưa đủ window
+        else:
+            speed_val = 0.0
+            if speed_state is not None:
+                speed_state.update(seeded=True, step=e.step, t=now_t, last_speed=0.0)
+        if speed_state is not None and speed_val > 0:
+            speed_state["last_speed"] = speed_val
         speed_str = f"{speed_val:.1f} step/s" if speed_val >= 1 else f"{1/speed_val:.1f} s/step" if speed_val > 0 else "-"
         eta_val = (total_steps - e.step) / speed_val if speed_val > 0 else 0
         # ⚠️ Hiển thị step GLOBAL thật (vd 3799/12390) — không modulo theo epoch
@@ -231,6 +251,8 @@ def main():
             resume_base = max(resume_base, int(ck.get("global_step", 0)))
         except Exception:
             pass
+    # ⚠️ Aug 15: speed_state — delta speed giữa 2 lần poll TB (ETA chính xác)
+    speed_state: dict = {"seeded": False, "step": resume_base, "t": time.time()}
     last_step_line = ""
     start_time = time.time()
     # ⚠️ Aug 15: chỉ poll TB khi stdout IM LẶNG (không render step mới ≥ 60s).
@@ -254,14 +276,14 @@ def main():
     while True:
         # ⚠️ Đọc stdout với timeout — nếu Lightning im lặng (Rich non-TTY sau resume)
         # thì poll TensorBoard events (nguồn loss/step LUÔN có)
-        rlist, _, _ = select.select([out], [], [], 10)
-        # ⚠️⚠️ Aug 15: poll TB CHỈ khi stdout im lặng ≥ 60s (không render step mới).
+        rlist, _, _ = select.select([out], [], [], 3)
+        # ⚠️⚠️ Aug 15: poll TB khi stdout im ≥ 3s — render MỌI step mới
+        # (dedup bằng last_tb_step) → mỗi step đúng 1 dòng. select timeout 3s
+        # (không 10s) → delta time speed chính xác (10s làm d_time phóng đại → ETA sai).
         # stdout parser render chuẩn 1 lần/step; TB poll chỉ là fallback khi resume "0/?"
-        # Trước đó poll định kỳ 30s → CÙNG step render 2 lần (Teedyy báo "in ra 2 lần")
         now = time.time()
-        if now - last_stdout_render > 60:
-            last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time, resume_base)
-            last_stdout_render = now  # reset — không poll lại ngay
+        if now - last_stdout_render > 3:
+            last_tb_step = _poll_tensorboard(ckpt_dir, args, cfg, last_tb_step, start_time, resume_base, speed_state)
             # Push checkpoint theo step (async — không block training)
             _maybe_push(ckpt_dir, args.stage, hf_cfg, push_every, pushed, pushing, pushed_steps)
         if not rlist:
